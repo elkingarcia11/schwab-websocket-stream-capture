@@ -1,11 +1,43 @@
 """
-Schwab WebSocket Client
-Establishes connection with Schwab via WebSocket and subscribes to:
-1. Chart data based on symbols.txt
-2. Options data based on symbols.txt
+schwab-websocket-stream-capture
+
+Schwab WebSocket stream capture (no OAuth in this client):
+1. Read Schwab access token from a local file (Trader API: Account Access + User Preferences)
+2. Load equity/option symbols from files, OR fetch a full option chain via --option-chain
+3. Connect to the Schwab streaming WebSocket
+4. Subscribe to CHART_EQUITY and/or LEVELONE_OPTIONS
+5. Persist streamed data to Parquet (`.parquet`, zstd)
+
+Required file formats
+---------------------
+Access token file (default: schwab_access_token.txt):
+  - Single line containing the raw access token only
+  - Must be a Trader API token with Account Access + User Preferences
+    (not a Market Data-only token — streaming needs GET /trader/v1/userPreference)
+  - No "Bearer " prefix, no quotes, no JSON; # comment lines are allowed
+  - Example: see schwab_access_token.txt.example
+
+Equity symbols file (default: symbols.txt):
+  - One line of comma-separated ticker symbols
+  - Example: SPY,TSLA,AAPL
+  - See symbols.txt.example
+
+Option symbols file (default: options_symbols.txt):
+  - One line of comma-separated Schwab option contract symbols (OSI style)
+  - Preserve spacing as returned by Schwab (root is space-padded to 6 chars)
+  - Example: AAPL  251031C00110000,AAPL  251031C00120000
+  - See options_symbols.txt.example
+
+Option-chain CLI mode (--option-chain SYMBOL --min-dte N):
+  - Fetches call+put contracts for the earliest expiration with DTE >= N
+  - Default: entire strike chain; optional --strike-range K = ATM center +/- K strikes
+  - Subscribes contracts on one LEVELONE_OPTIONS stream (tested up to 310)
+  - Writes buffered Parquet (`.parquet`, zstd) under data/options/
+
+Either symbols file may be empty or omitted; only non-empty lists are subscribed.
 """
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any, Tuple
 
 import json
 import time
@@ -17,25 +49,55 @@ import httpx
 import websocket
 import pytz
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+
+# Default configuration file paths and formats
+DEFAULT_ACCESS_TOKEN_FILE = 'schwab_access_token.txt'
+DEFAULT_EQUITY_SYMBOLS_FILE = 'symbols.txt'
+DEFAULT_OPTION_SYMBOLS_FILE = 'options_symbols.txt'
+DEFAULT_DATA_OUTPUT_DIR = 'data'
+MARKET_DATA_BASE = 'https://api.schwabapi.com/marketdata/v1'
+DEFAULT_PARQUET_FLUSH_ROWS = 250
+DEFAULT_PARQUET_COMPRESSION = 'zstd'
+
+# Schwab streamer response codes relevant to subscription limits
+STREAM_CODE_SUCCESS = 0
+STREAM_CODE_REACHED_SYMBOL_LIMIT = 19
 
 
 class SchwabWebSocketClient:
     """Schwab WebSocket client for streaming chart and options data"""
 
-    def __init__(self, debug: bool = False, symbols_filepath: str = 'symbols.txt',
-                 option_symbols_filepath: str = 'options_symbols.txt',
-                 access_token_filepath: str = 'schwab_access_token.txt',
-                 data_output_dir: str = 'data'):
+    def __init__(self, debug: bool = False,
+                 symbols_filepath: str = DEFAULT_EQUITY_SYMBOLS_FILE,
+                 option_symbols_filepath: str = DEFAULT_OPTION_SYMBOLS_FILE,
+                 access_token_filepath: str = DEFAULT_ACCESS_TOKEN_FILE,
+                 data_output_dir: str = DEFAULT_DATA_OUTPUT_DIR,
+                 equity_symbols: Optional[List[str]] = None,
+                 option_symbols: Optional[List[str]] = None,
+                 auto_subscribe: bool = True,
+                 parquet_flush_rows: int = DEFAULT_PARQUET_FLUSH_ROWS,
+                 parquet_compression: str = DEFAULT_PARQUET_COMPRESSION):
         self.debug = debug
         self.access_token_filepath = access_token_filepath
         self.data_output_dir = data_output_dir
+        self.auto_subscribe = auto_subscribe
+        self.parquet_flush_rows = max(1, parquet_flush_rows)
+        self.parquet_compression = parquet_compression
 
-        # Read equity symbols from file
-        self.symbols = self.load_symbols_from_file(symbols_filepath)
+        # Prefer in-memory symbol lists when provided (e.g. --option-chain mode)
+        if equity_symbols is not None:
+            self.symbols = list(equity_symbols)
+        else:
+            self.symbols = self.load_symbols_from_file(symbols_filepath)
 
-        # Read option symbols from file
-        self.option_symbols = self.load_symbols_from_file(
-            option_symbols_filepath)
+        if option_symbols is not None:
+            self.option_symbols = list(option_symbols)
+        else:
+            self.option_symbols = self.load_symbols_from_file(
+                option_symbols_filepath)
 
         # WebSocket connection
         self.ws: Optional[websocket.WebSocketApp] = None
@@ -44,8 +106,21 @@ class SchwabWebSocketClient:
         self.request_id = 1
         self.subscriptions = {}
 
+        # Subscription command response tracking (SUBS/ADD/UNSUBS)
+        self._subscription_lock = threading.Lock()
+        self._subscription_events: Dict[int, threading.Event] = {}
+        self._subscription_results: Dict[int, Dict[str, Any]] = {}
+
+        # Parquet write buffers / open writers (row-group append)
+        self._parquet_lock = threading.Lock()
+        self._parquet_buffers: Dict[str, List[Dict[str, Any]]] = {}
+        self._parquet_writers: Dict[str, pq.ParquetWriter] = {}
+
         # Store previous option values for merging partial updates
         self.previous_option_values: Dict[str, Dict] = {}
+
+        # Optional callback: on_option_update(symbol: str, parsed: dict) -> None
+        self.on_option_update = None
 
         # Market hours (ET timezone) - always use ET regardless of local timezone
         self.et_tz = pytz.timezone('US/Eastern')
@@ -86,7 +161,14 @@ class SchwabWebSocketClient:
             raise Exception("No SchwabClientCustomerId in streamer info")
 
     def load_symbols_from_file(self, filepath: str) -> List[str]:
-        """Load symbols from a comma-separated file"""
+        """
+        Load symbols from a comma-separated file.
+
+        Format: single line (or multi-line) of comma-separated symbols.
+        Equity example: SPY,TSLA,AAPL
+        Option example: AAPL  251031C00110000,AAPL  251031C00120000
+        Missing/empty files yield an empty list (that subscription is skipped).
+        """
         try:
             if not os.path.exists(filepath):
                 print(
@@ -98,30 +180,64 @@ class SchwabWebSocketClient:
                 if not content:
                     return []
 
-                # Split by comma and clean up
-                symbols = [s.strip() for s in content.split(',') if s.strip()]
-                print(
-                    f"✅ Loaded {len(symbols)} symbols from {filepath}: {', '.join(symbols)}")
-                return symbols
+            # Split by comma; strip surrounding whitespace only (keep option padding)
+            symbols = [s.strip() for s in content.replace('\n', ',').split(',') if s.strip()]
+            print(
+                f"✅ Loaded {len(symbols)} symbols from {filepath}: {', '.join(symbols)}")
+            return symbols
         except Exception as e:
             print(f"❌ Error loading symbols from {filepath}: {e}")
             return []
 
     def get_access_token(self) -> str:
-        """Read access token from file"""
+        """
+        Read access token from file.
+
+        Required format for {access_token_filepath}:
+          - Plain text file with the raw Trader API access token on one line
+          - Must authorize Accounts and Trading: Account Access + User Preferences
+            (Market Data-only tokens are not enough — userPreference will 401)
+          - No "Bearer " prefix, no quotes, no JSON wrapper
+          - Lines starting with # and blank lines are ignored
+          - Copy from schwab_access_token.txt.example and replace the placeholder
+        """
         try:
             if not os.path.exists(self.access_token_filepath):
                 raise Exception(
-                    f"Access token file not found: {self.access_token_filepath}")
+                    f"Access token file not found: {self.access_token_filepath}. "
+                    f"Create it from schwab_access_token.txt.example "
+                    f"(Trader API Account Access + User Preferences token).")
 
             with open(self.access_token_filepath, 'r') as f:
-                token = f.read().strip()
+                lines = f.readlines()
+
+            token = ""
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+                token = stripped
+                break
 
             if not token:
                 raise Exception(
                     f"Access token file is empty: {self.access_token_filepath}")
 
-            # Return token as-is (no character removal)
+            # Reject common mis-formats early
+            if token.startswith('{') or token.startswith('['):
+                raise Exception(
+                    f"Access token file must contain the raw token string, not JSON: "
+                    f"{self.access_token_filepath}")
+            if token.lower().startswith('bearer '):
+                token = token[7:].strip()
+            if (token.startswith('"') and token.endswith('"')) or (
+                    token.startswith("'") and token.endswith("'")):
+                token = token[1:-1].strip()
+
+            if not token:
+                raise Exception(
+                    f"Access token file has no usable token: {self.access_token_filepath}")
+
             return token
 
         except Exception as e:
@@ -130,9 +246,8 @@ class SchwabWebSocketClient:
             raise
 
     def get_user_preferences(self):
-        """Get user preferences using the access token from file"""
+        """Fetch streamer info using the access token read from file (no OAuth)."""
         try:
-            # Read token from file
             access_token = self.get_access_token()
             if not access_token:
                 raise Exception("Failed to get valid access token")
@@ -157,6 +272,186 @@ class SchwabWebSocketClient:
             if self.debug:
                 print(f"❌ Error getting user preferences: {e}")
             raise
+
+    def _market_data_headers(self) -> Dict[str, str]:
+        return {
+            'Authorization': f'Bearer {self.get_access_token()}',
+            'Accept': 'application/json',
+        }
+
+    def find_expiration(
+            self, underlying: str, min_dte: int = 0) -> Tuple[str, int]:
+        """
+        Return (expirationDate YYYY-MM-DD, daysToExpiration) for the earliest
+        expiration with daysToExpiration >= min_dte.
+        """
+        url = f"{MARKET_DATA_BASE}/expirationchain"
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(
+                url, headers=self._market_data_headers(),
+                params={"symbol": underlying})
+
+        if response.status_code != 200:
+            raise Exception(
+                f"Expiration chain failed: {response.status_code} - {response.text}")
+
+        expirations = response.json().get("expirationList", [])
+        if not expirations:
+            raise Exception(f"No expirations returned for {underlying}")
+
+        eligible = [
+            e for e in expirations
+            if int(e.get("daysToExpiration", -1)) >= min_dte
+        ]
+        if eligible:
+            chosen = min(
+                eligible, key=lambda e: int(e.get("daysToExpiration", 10**9)))
+        else:
+            chosen = max(
+                expirations, key=lambda e: int(e.get("daysToExpiration", -1)))
+            print(
+                f"⚠️ No expiration with DTE>={min_dte} for {underlying}; "
+                f"using farthest available DTE={chosen.get('daysToExpiration')}")
+
+        exp_date = chosen["expirationDate"]
+        dte = int(chosen.get("daysToExpiration", -1))
+        print(
+            f"🎯 Using {underlying} expiration {exp_date} "
+            f"(DTE={dte}, min_dte={min_dte})")
+        return exp_date, dte
+
+    def fetch_option_chain_contracts(
+            self,
+            underlying: str,
+            expiration_date: str,
+            contract_type: str = "ALL",
+            strike_range: Optional[int] = None) -> List[str]:
+        """
+        Fetch Schwab OSI option symbols for one expiration.
+
+        Args:
+            strike_range: If None or 0, request the entire strike chain.
+                          If > 0, request ATM center +/- strike_range strikes
+                          (Schwab chains `strikeCount`).
+        """
+        params: Dict[str, Any] = {
+            "symbol": underlying,
+            "contractType": contract_type,
+            "includeUnderlyingQuote": "true",
+            "strategy": "SINGLE",
+            "fromDate": expiration_date,
+            "toDate": expiration_date,
+        }
+        if strike_range is not None and strike_range > 0:
+            params["strikeCount"] = str(strike_range)
+
+        url = f"{MARKET_DATA_BASE}/chains"
+        with httpx.Client(timeout=60.0) as client:
+            response = client.get(
+                url, headers=self._market_data_headers(), params=params)
+
+        if response.status_code != 200:
+            raise Exception(
+                f"Option chain failed: {response.status_code} - {response.text}")
+
+        chain = response.json()
+        symbols: List[str] = []
+        for map_name in ("callExpDateMap", "putExpDateMap"):
+            exp_map = chain.get(map_name) or {}
+            for _exp_key, strikes in exp_map.items():
+                for _strike, contracts in strikes.items():
+                    for contract in contracts:
+                        symbol = contract.get("symbol")
+                        if symbol:
+                            symbols.append(symbol)
+
+        unique = list(dict.fromkeys(symbols))
+        underlying_price = chain.get("underlyingPrice")
+        if underlying_price is not None:
+            print(f"💰 Underlying price: ${float(underlying_price):.2f}")
+        range_desc = (
+            f"ATM +/- {strike_range} strikes"
+            if strike_range and strike_range > 0
+            else "entire strike chain"
+        )
+        print(
+            f"📦 Loaded {len(unique)} {underlying} contracts "
+            f"for {expiration_date} (type={contract_type}, {range_desc})")
+        return unique
+
+    def load_option_chain(
+            self,
+            underlying: str,
+            min_dte: int = 0,
+            contract_type: str = "ALL",
+            strike_range: Optional[int] = None) -> Tuple[List[str], str, int]:
+        """
+        Resolve earliest expiration with DTE >= min_dte and load chain symbols.
+
+        strike_range None/0 = entire chain; >0 = ATM center +/- that many strikes.
+
+        Returns (contracts, expiration_date, dte).
+        """
+        expiration_date, dte = self.find_expiration(underlying, min_dte=min_dte)
+        contracts = self.fetch_option_chain_contracts(
+            underlying,
+            expiration_date,
+            contract_type=contract_type,
+            strike_range=strike_range,
+        )
+        if not contracts:
+            raise Exception(
+                f"No option contracts found for {underlying} {expiration_date}")
+        self.option_symbols = list(contracts)
+        return contracts, expiration_date, dte
+
+    def subscribe_option_chain(
+            self, contracts: List[str], batch_size: int = 50) -> int:
+        """
+        Subscribe to a full option chain on one connection (SUBS + ADD batches).
+
+        Returns the number of contracts accepted.
+        """
+        if not contracts:
+            raise Exception("No contracts to subscribe")
+        if batch_size < 1:
+            raise Exception("batch_size must be >= 1")
+
+        accepted: List[str] = []
+        print(
+            f"📡 Subscribing to {len(contracts)} LEVELONE_OPTIONS contracts "
+            f"(batch_size={batch_size})...")
+
+        first = contracts[:batch_size]
+        rest = contracts[batch_size:]
+        result = self.subscribe_options_data(
+            first, wait_for_response=True, timeout=30.0)
+        if not result or result.get("code") != STREAM_CODE_SUCCESS:
+            raise Exception(f"Initial SUBS failed: {result}")
+        accepted.extend(first)
+        print(f"✅ SUBS accepted {len(first)} (total={len(accepted)})")
+
+        idx = 0
+        while idx < len(rest):
+            batch = rest[idx:idx + batch_size]
+            idx += batch_size
+            result = self.add_options_data(
+                batch, wait_for_response=True, timeout=30.0)
+            if not result or result.get("code") != STREAM_CODE_SUCCESS:
+                if result and result.get("code") == STREAM_CODE_REACHED_SYMBOL_LIMIT:
+                    print(
+                        f"🚫 REACHED_SYMBOL_LIMIT after {len(accepted)} contracts")
+                    break
+                raise Exception(f"ADD failed at total={len(accepted)}: {result}")
+            accepted.extend(batch)
+            print(f"✅ ADD accepted +{len(batch)} (total={len(accepted)})")
+
+        self.option_symbols = list(accepted)
+        self.subscriptions["LEVELONE_OPTIONS"] = list(accepted)
+        print(
+            f"✅ Option chain subscription ready: "
+            f"{len(accepted)}/{len(contracts)} contracts")
+        return len(accepted)
 
     def wait_for_market_open(self):
         """
@@ -457,119 +752,141 @@ class SchwabWebSocketClient:
                 print(f"❌ Error parsing option data: {e}")
             return {}
 
-    def save_chart_data_to_csv(self, symbol: str, data: dict):
-        """
-        Save a new row of chart data to CSV file.
+    @staticmethod
+    def _clean_symbol_filename(symbol: str) -> str:
+        return symbol.replace(' ', '').replace('/', '_').replace('\\', '_')
 
-        Args:
-            symbol (str): Equity symbol name
-            data (dict): Chart data row to save (should contain timestamp, open, high, low, close, volume)
-        """
+    @staticmethod
+    def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+        """Cast/reindex columns to match an existing ParquetWriter schema."""
+        columns = []
+        for field in schema:
+            if field.name in table.column_names:
+                col = table.column(field.name)
+                try:
+                    columns.append(col.cast(field.type, safe=False))
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError, TypeError):
+                    # Fall back to Python values then rebuild array
+                    columns.append(
+                        pa.array(col.to_pylist(), type=field.type))
+            else:
+                columns.append(pa.nulls(table.num_rows, type=field.type))
+        return pa.Table.from_arrays(columns, schema=schema)
+
+    def _queue_parquet_row(self, kind: str, symbol: str, data: dict):
+        """Buffer one row and flush to Parquet when the batch is full."""
+        clean_symbol = self._clean_symbol_filename(symbol)
+        os.makedirs(f'{self.data_output_dir}/{kind}', exist_ok=True)
+        path = f'{self.data_output_dir}/{kind}/{clean_symbol}.parquet'
+        row = dict(data)
+
+        with self._parquet_lock:
+            buffer = self._parquet_buffers.setdefault(path, [])
+            buffer.append(row)
+            if len(buffer) >= self.parquet_flush_rows:
+                self._flush_parquet_path_locked(path)
+
+    def _flush_parquet_path_locked(self, path: str):
+        """Flush one symbol buffer to disk. Caller must hold _parquet_lock."""
+        rows = self._parquet_buffers.get(path) or []
+        if not rows:
+            return
+
+        self._parquet_buffers[path] = []
+        table = pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False)
+        writer = self._parquet_writers.get(path)
+
         try:
-            # Create equity directory if it doesn't exist
-            os.makedirs(f'{self.data_output_dir}/equity', exist_ok=True)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    path,
+                    table.schema,
+                    compression=self.parquet_compression,
+                )
+                self._parquet_writers[path] = writer
+            else:
+                table = self._align_table_to_schema(table, writer.schema)
+            writer.write_table(table)
+        except Exception:
+            # Put rows back so a later flush / disconnect can retry
+            self._parquet_buffers[path] = rows + self._parquet_buffers.get(
+                path, [])
+            raise
 
-            # Clean the symbol for filename (remove spaces and special characters)
-            clean_symbol = symbol.replace(' ', '').replace(
-                '/', '_').replace('\\', '_')
+        if self.debug:
+            print(f"💾 Flushed {len(rows)} rows → {path}")
 
-            # Define CSV file path
-            csv_file = f'{self.data_output_dir}/equity/{clean_symbol}.csv'
+    def flush_parquet(self):
+        """Flush all buffered Parquet rows to disk."""
+        with self._parquet_lock:
+            for path in list(self._parquet_buffers.keys()):
+                if self._parquet_buffers.get(path):
+                    self._flush_parquet_path_locked(path)
 
-            # Add ET time column (keep original time field as milliseconds)
+    def close_parquet_writers(self):
+        """Flush buffers and close all open Parquet writers."""
+        with self._parquet_lock:
+            for path in list(self._parquet_buffers.keys()):
+                if self._parquet_buffers.get(path):
+                    try:
+                        self._flush_parquet_path_locked(path)
+                    except Exception as e:
+                        print(f"❌ Error flushing Parquet {path}: {e}")
+            for path, writer in list(self._parquet_writers.items()):
+                try:
+                    writer.close()
+                except Exception as e:
+                    print(f"❌ Error closing Parquet writer {path}: {e}")
+            self._parquet_writers.clear()
+
+    def save_chart_data_to_csv(self, symbol: str, data: dict):
+        """Buffer a chart row and write to Parquet (method name kept for compatibility)."""
+        try:
             if 'time' in data and isinstance(data['time'], int) and data['time'] > 0:
                 try:
-                    # Convert milliseconds since epoch to ET timezone datetime string
                     timestamp_dt = pd.Timestamp(
                         data['time'], unit='ms', tz='US/Eastern')
-                    # Add ET time column (keep original time field unchanged)
                     data['time_et'] = timestamp_dt.strftime(
                         '%Y-%m-%d %H:%M:%S %Z')  # type: ignore
                 except (ValueError, OverflowError, AttributeError):
-                    pass  # Skip invalid timestamps
+                    pass
 
-            # Convert data to DataFrame
-            df_new = pd.DataFrame([data])
-
-            # Check if file exists
-            if os.path.exists(csv_file):
-                # Append to existing file
-                df_new.to_csv(csv_file, mode='a', header=False, index=False)
-            else:
-                # Create new file with headers
-                df_new.to_csv(csv_file, index=False)
-
-            if self.debug:
-                print(f"💾 Saved chart data for {symbol} to {csv_file}")
-
+            self._queue_parquet_row('equity', symbol, data)
         except Exception as e:
             print(f"❌ Error saving chart data for {symbol}: {e}")
 
     def save_options_data_to_csv(self, symbol: str, data: dict):
-        """
-        Save a new row of options data to CSV file.
-
-        Args:
-            symbol (str): Option symbol name
-            data (dict): Option data row to save
-        """
+        """Buffer an option row and write to Parquet (method name kept for compatibility)."""
         try:
-            # Create options directory if it doesn't exist
-            os.makedirs(f'{self.data_output_dir}/options', exist_ok=True)
-
-            # Clean the symbol for filename (remove spaces and special characters)
-            clean_symbol = symbol.replace(' ', '').replace(
-                '/', '_').replace('\\', '_')
-
-            # Define CSV file path
-            csv_file = f'{self.data_output_dir}/options/{clean_symbol}.csv'
-
-            # Add ET time column for options (keep all original timestamp fields unchanged)
-            # Use field 54 (Indicative Quote Time) as primary timestamp, fall back to quote_time or trade_time
             timestamp_ms = 0
-            timestamp_field_name = None
             if 'indicative_quote_time' in data and isinstance(data['indicative_quote_time'], int) and data['indicative_quote_time'] > 0:
                 timestamp_ms = data['indicative_quote_time']
-                timestamp_field_name = 'indicative_quote_time'
             elif 'quote_time' in data and isinstance(data['quote_time'], int) and data['quote_time'] > 0:
                 timestamp_ms = data['quote_time']
-                timestamp_field_name = 'quote_time'
             elif 'trade_time' in data and isinstance(data['trade_time'], int) and data['trade_time'] > 0:
                 timestamp_ms = data['trade_time']
-                timestamp_field_name = 'trade_time'
 
-            # Convert the timestamp to ET datetime and add as new column (keep original unchanged)
             if timestamp_ms > 0:
                 try:
                     timestamp_dt = pd.Timestamp(
                         timestamp_ms, unit='ms', tz='US/Eastern')
-                    # Add ET time column (keep all original timestamp fields unchanged)
                     data['time_et'] = timestamp_dt.strftime(
                         '%Y-%m-%d %H:%M:%S %Z')  # type: ignore
                 except (ValueError, OverflowError, AttributeError):
-                    pass  # Skip invalid timestamps
+                    pass
 
-            # Keep all original fields - don't remove anything
-
-            # Convert data to DataFrame
-            df_new = pd.DataFrame([data])
-
-            # Check if file exists
-            if os.path.exists(csv_file):
-                # Append to existing file
-                df_new.to_csv(csv_file, mode='a', header=False, index=False)
-            else:
-                # Create new file with headers
-                df_new.to_csv(csv_file, index=False)
-
-            if self.debug:
-                print(f"💾 Saved options data for {symbol} to {csv_file}")
-
+            self._queue_parquet_row('options', symbol, data)
         except Exception as e:
             print(f"❌ Error saving options data for {symbol}: {e}")
 
-    def connect(self):
-        """Connect to WebSocket and start streaming"""
+    def connect(self, run_until_close: bool = True):
+        """
+        Connect to WebSocket and log in.
+
+        Args:
+            run_until_close: If True (default), block until market close or disconnect.
+                             If False, return after successful login (for tests).
+        """
         try:
             # Get streamer info from user preferences
             if not self.streamer_info:
@@ -613,6 +930,9 @@ class SchwabWebSocketClient:
 
             print("✅ Successfully connected and logged in to WebSocket")
 
+            if not run_until_close:
+                return
+
             # Keep the main thread alive and check for market close
             while self.running and self.connected:
                 # Check if it's after market close (4:00:30 PM ET)
@@ -621,6 +941,7 @@ class SchwabWebSocketClient:
                         "🕐 Market close time (4:00:30 PM ET) reached, disconnecting...")
                     self.disconnect()
                     break
+                self.flush_parquet()
                 time.sleep(1)
 
         except Exception as e:
@@ -630,11 +951,12 @@ class SchwabWebSocketClient:
             raise
 
     def disconnect(self):
-        """Disconnect from WebSocket API"""
+        """Disconnect from WebSocket API and flush Parquet buffers."""
         self.running = False
         if self.ws:
             self.ws.close()
         self.connected = False
+        self.close_parquet_writers()
         print("🔌 Disconnected from Schwab Streaming API")
 
     def on_open(self, _):
@@ -677,6 +999,113 @@ class SchwabWebSocketClient:
         except Exception as e:
             print(f"❌ Login error: {str(e)}")
             raise
+
+    def _register_subscription_wait(self, request_id: int) -> threading.Event:
+        """Register a wait event for a subscription request id."""
+        event = threading.Event()
+        with self._subscription_lock:
+            self._subscription_events[request_id] = event
+            self._subscription_results.pop(request_id, None)
+        return event
+
+    def wait_for_subscription_response(
+            self, request_id: int, timeout: float = 15.0) -> Optional[Dict[str, Any]]:
+        """
+        Block until the streamer responds to a SUBS/ADD/UNSUBS request.
+
+        Returns the response content dict (includes code/msg), or None on timeout.
+        """
+        with self._subscription_lock:
+            event = self._subscription_events.get(request_id)
+            if event is None:
+                event = threading.Event()
+                self._subscription_events[request_id] = event
+
+        if not event.wait(timeout=timeout):
+            return None
+
+        with self._subscription_lock:
+            return self._subscription_results.pop(request_id, None)
+
+    def _send_options_command(
+            self, command: str, symbols: List[str],
+            wait_for_response: bool = False,
+            timeout: float = 15.0) -> Optional[Dict[str, Any]]:
+        """
+        Send LEVELONE_OPTIONS SUBS or ADD for the given option symbols.
+
+        SUBS replaces the full options subscription set.
+        ADD appends symbols without clearing existing ones.
+        """
+        if not self.connected:
+            print("❌ Not connected to WebSocket")
+            return None
+
+        if not symbols:
+            print("⚠️ No symbols provided for options data subscription")
+            return None
+
+        request_id = self.request_id
+        request = {
+            "service": "LEVELONE_OPTIONS",
+            "command": command,
+            "requestid": request_id,
+            "SchwabClientCustomerId": self.schwab_websocket_client_customer_id,
+            "SchwabClientCorrelId": f"option_{int(time.time() * 1000)}",
+            "parameters": {
+                "keys": ",".join(symbols),
+                # All available LEVELONE_OPTIONS fields
+                "fields": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55"
+            }
+        }
+
+        event = None
+        if wait_for_response:
+            event = self._register_subscription_wait(request_id)
+
+        if self.debug:
+            print(
+                f"📤 Sending LEVELONE_OPTIONS {command} "
+                f"({len(symbols)} symbols): {json.dumps(request, indent=2)}")
+
+        if self.ws:
+            self.ws.send(json.dumps(request))
+        self.request_id += 1
+
+        print(
+            f"📤 Sent LEVELONE_OPTIONS {command} for {len(symbols)} contracts "
+            f"(requestid={request_id})")
+
+        if wait_for_response and event is not None:
+            result = self.wait_for_subscription_response(
+                request_id, timeout=timeout)
+            if result is None:
+                print(
+                    f"⚠️ Timed out waiting for LEVELONE_OPTIONS {command} "
+                    f"response (requestid={request_id})")
+                return None
+
+            if result.get("code") == STREAM_CODE_SUCCESS:
+                if command == "SUBS":
+                    self.subscriptions["LEVELONE_OPTIONS"] = list(symbols)
+                    self.option_symbols = list(symbols)
+                elif command == "ADD":
+                    existing = self.subscriptions.get("LEVELONE_OPTIONS", [])
+                    merged = list(dict.fromkeys(existing + list(symbols)))
+                    self.subscriptions["LEVELONE_OPTIONS"] = merged
+                    self.option_symbols = merged
+            return result
+
+        # Fire-and-forget (legacy streaming path): update bookkeeping immediately
+        if command == "SUBS":
+            self.subscriptions["LEVELONE_OPTIONS"] = list(symbols)
+            self.option_symbols = list(symbols)
+        elif command == "ADD":
+            existing = self.subscriptions.get("LEVELONE_OPTIONS", [])
+            merged = list(dict.fromkeys(existing + list(symbols)))
+            self.subscriptions["LEVELONE_OPTIONS"] = merged
+            self.option_symbols = merged
+        return None
 
     def subscribe_chart_data(self, symbols: List[str]):
         """Subscribe to CHART_EQUITY data for the given symbols"""
@@ -722,50 +1151,28 @@ class SchwabWebSocketClient:
             print(f"❌ Error subscribing to CHART_EQUITY data: {e}")
             raise
 
-    def subscribe_options_data(self, symbols: List[str]):
-        """Subscribe to LEVELONE_OPTIONS data for the given symbols"""
-        if not self.connected:
-            print("❌ Not connected to WebSocket")
-            return
-
-        if not symbols:
-            print("⚠️ No symbols provided for options data subscription")
-            return
-
-        # Note: For options, you typically need option contract symbols (e.g., SPY_123123C00123456)
-        # not equity symbols. This is a basic implementation - you may need to convert
-        # equity symbols to option symbols first.
+    def subscribe_options_data(
+            self, symbols: List[str], wait_for_response: bool = False,
+            timeout: float = 15.0) -> Optional[Dict[str, Any]]:
+        """Subscribe to LEVELONE_OPTIONS data (SUBS replaces prior options keys)."""
         try:
-            # Prepare the subscription request for option data
-            request = {
-                "service": "LEVELONE_OPTIONS",
-                "command": "SUBS",
-                "requestid": self.request_id,
-                "SchwabClientCustomerId": self.schwab_websocket_client_customer_id,
-                "SchwabClientCorrelId": f"option_{int(time.time() * 1000)}",
-                "parameters": {
-                    "keys": ",".join(symbols),
-                    "fields": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55"  # All available fields
-                }
-            }
-
-            if self.debug:
-                print(
-                    f"📤 Sending LEVELONE_OPTIONS subscription request: {json.dumps(request, indent=2)}")
-
-            # Send the subscription request
-            if self.ws:
-                self.ws.send(json.dumps(request))
-            self.request_id += 1
-
-            # Store the subscription
-            self.subscriptions["LEVELONE_OPTIONS"] = symbols
-
-            print(
-                f"✅ Subscribed to LEVELONE_OPTIONS data for: {', '.join(symbols)}")
-
+            return self._send_options_command(
+                "SUBS", symbols,
+                wait_for_response=wait_for_response, timeout=timeout)
         except Exception as e:
             print(f"❌ Error subscribing to LEVELONE_OPTIONS data: {e}")
+            raise
+
+    def add_options_data(
+            self, symbols: List[str], wait_for_response: bool = False,
+            timeout: float = 15.0) -> Optional[Dict[str, Any]]:
+        """Add LEVELONE_OPTIONS symbols without clearing existing subscriptions."""
+        try:
+            return self._send_options_command(
+                "ADD", symbols,
+                wait_for_response=wait_for_response, timeout=timeout)
+        except Exception as e:
+            print(f"❌ Error adding LEVELONE_OPTIONS data: {e}")
             raise
 
     def on_message(self, _, message):
@@ -779,40 +1186,81 @@ class SchwabWebSocketClient:
             # Handle different message types
             if isinstance(data, dict):
                 if "response" in data:
-                    # Login response
-                    response_data = data["response"][0]
-                    if response_data.get("command") == "LOGIN":
+                    for response_data in data["response"]:
+                        command = response_data.get("command")
                         content = response_data.get("content", {})
                         code = content.get("code", -1)
-                        if code == 0:
-                            print("✅ WebSocket login successful")
-                            msg = content.get("msg", "")
-                            if "status=" in msg:
-                                status = msg.split("status=")[1].split(
-                                    ";")[0] if ";" in msg else msg.split("status=")[1]
-                                print(f"📊 Account status: {status}")
-                            self.connected = True
+                        msg = content.get("msg", "")
+                        service = response_data.get("service", "")
 
-                            # Subscribe to chart and options data after successful login
-                            print("📊 Subscribing to chart and options data...")
-                            if self.symbols:
-                                self.subscribe_chart_data(self.symbols)
+                        # Normalize request id (streamer may send int or str)
+                        raw_request_id = response_data.get("requestid")
+                        try:
+                            request_id = int(raw_request_id) if raw_request_id is not None else None
+                        except (TypeError, ValueError):
+                            request_id = None
+
+                        if command == "LOGIN":
+                            if code == STREAM_CODE_SUCCESS:
+                                print("✅ WebSocket login successful")
+                                if "status=" in msg:
+                                    status = msg.split("status=")[1].split(
+                                        ";")[0] if ";" in msg else msg.split("status=")[1]
+                                    print(f"📊 Account status: {status}")
+                                self.connected = True
+
+                                if self.auto_subscribe:
+                                    print(
+                                        "📊 Subscribing to chart and options data...")
+                                    if self.symbols:
+                                        self.subscribe_chart_data(self.symbols)
+                                    else:
+                                        print(
+                                            "⚠️ No equity symbols loaded, skipping chart data subscription")
+
+                                    if self.option_symbols:
+                                        self.subscribe_options_data(
+                                            self.option_symbols)
+                                    else:
+                                        print(
+                                            "⚠️ No option symbols loaded, skipping options data subscription")
+                                else:
+                                    print(
+                                        "ℹ️ auto_subscribe=False — waiting for manual subscriptions")
                             else:
                                 print(
-                                    "⚠️ No equity symbols loaded, skipping chart data subscription")
+                                    f"❌ WebSocket login failed with code: {code}")
+                                print(
+                                    f"   Message: {content.get('msg', 'Unknown error')}")
+                                self.connected = False
 
-                            if self.option_symbols:
-                                self.subscribe_options_data(
-                                    self.option_symbols)
+                        elif command in ("SUBS", "ADD", "UNSUBS", "VIEW"):
+                            if code == STREAM_CODE_SUCCESS:
+                                print(
+                                    f"✅ {service} {command} accepted "
+                                    f"(requestid={request_id})")
+                            elif code == STREAM_CODE_REACHED_SYMBOL_LIMIT:
+                                print(
+                                    f"🚫 {service} {command} hit REACHED_SYMBOL_LIMIT "
+                                    f"(code={code}, requestid={request_id}): {msg}")
                             else:
                                 print(
-                                    "⚠️ No option symbols loaded, skipping options data subscription")
-                        else:
-                            print(
-                                f"❌ WebSocket login failed with code: {code}")
-                            print(
-                                f"   Message: {content.get('msg', 'Unknown error')}")
-                            self.connected = False
+                                    f"⚠️ {service} {command} response "
+                                    f"code={code} requestid={request_id}: {msg}")
+
+                            if request_id is not None:
+                                with self._subscription_lock:
+                                    self._subscription_results[request_id] = {
+                                        "service": service,
+                                        "command": command,
+                                        "code": code,
+                                        "msg": msg,
+                                        "content": content,
+                                    }
+                                    event = self._subscription_events.get(
+                                        request_id)
+                                    if event:
+                                        event.set()
 
                 elif "notify" in data:
                     # Heartbeat or other notifications
@@ -823,12 +1271,18 @@ class SchwabWebSocketClient:
                     elif notify_data.get("service") == "ADMIN":
                         content = notify_data.get("content", {})
                         if content.get("code") == 30:  # Empty subscription
-                            print("⚠️ Empty subscription detected, resubscribing...")
-                            if self.symbols:
-                                self.subscribe_chart_data(self.symbols)
-                            if self.option_symbols:
-                                self.subscribe_options_data(
-                                    self.option_symbols)
+                            if self.auto_subscribe:
+                                print(
+                                    "⚠️ Empty subscription detected, resubscribing...")
+                                if self.symbols:
+                                    self.subscribe_chart_data(self.symbols)
+                                if self.option_symbols:
+                                    self.subscribe_options_data(
+                                        self.option_symbols)
+                            else:
+                                print(
+                                    "⚠️ Empty subscription detected "
+                                    "(auto_subscribe=False, not resubscribing)")
 
                 elif "data" in data:
                     # Market data
@@ -885,6 +1339,14 @@ class SchwabWebSocketClient:
 
                                     # Only save if symbol matches any in our subscription list
                                     if normalized_symbol in normalized_option_symbols or any(norm_sym in normalized_symbol for norm_sym in normalized_option_symbols):
+                                        if self.on_option_update:
+                                            try:
+                                                self.on_option_update(
+                                                    symbol, parsed_option)
+                                            except Exception as cb_err:
+                                                if self.debug:
+                                                    print(
+                                                        f"⚠️ on_option_update error: {cb_err}")
                                         # Save to CSV (save whenever we have valid data)
                                         if parsed_option.get('last_price', 0) != 0 or parsed_option.get('bid_price', 0) != 0:
                                             self.save_options_data_to_csv(
@@ -918,57 +1380,129 @@ class SchwabWebSocketClient:
 
 
 if __name__ == "__main__":
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(
-        description='Schwab WebSocket Client for streaming market data',
+        description='schwab-websocket-stream-capture: stream Schwab market data to Parquet',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
   python schwab_websocket_client.py
   python schwab_websocket_client.py --symbols my_symbols.txt --options my_options.txt
+  python schwab_websocket_client.py --option-chain SPY --min-dte 10
+  python schwab_websocket_client.py --option-chain SPY --min-dte 10 --strike-range 25
+  python schwab_websocket_client.py --option-chain SPY --min-dte 0 --data-dir ./spy_0dte
   python schwab_websocket_client.py --data-dir /path/to/data --debug
         '''
     )
-    parser.add_argument('--symbols', '-s', type=str, default='symbols.txt',
-                        help='Path to equity symbols file (default: symbols.txt)')
-    parser.add_argument('--options', '-o', type=str, default='options_symbols.txt',
-                        help='Path to option symbols file (default: options_symbols.txt)')
-    parser.add_argument('--token', '-t', type=str, default='schwab_access_token.txt',
-                        help='Path to access token file (default: schwab_access_token.txt)')
-    parser.add_argument('--data-dir', '-d', type=str, default='data',
-                        help='Output directory for CSV files (default: data)')
+    parser.add_argument('--symbols', '-s', type=str, default=DEFAULT_EQUITY_SYMBOLS_FILE,
+                        help=f'Equity symbols file, comma-separated (default: {DEFAULT_EQUITY_SYMBOLS_FILE})')
+    parser.add_argument('--options', '-o', type=str, default=DEFAULT_OPTION_SYMBOLS_FILE,
+                        help=f'Option symbols file, comma-separated OSI contracts (default: {DEFAULT_OPTION_SYMBOLS_FILE})')
+    parser.add_argument('--option-chain', type=str, default=None,
+                        help='Underlying ticker: fetch and stream the option chain '
+                             '(earliest expiration with DTE >= --min-dte)')
+    parser.add_argument('--min-dte', type=int, default=0,
+                        help='With --option-chain: earliest expiration whose DTE is >= this '
+                             '(default: 0 / 0DTE)')
+    parser.add_argument('--strike-range', type=int, default=0,
+                        help='With --option-chain: ATM center +/- N strikes '
+                             '(default: 0 = entire strike chain)')
+    parser.add_argument('--contract-type', choices=['ALL', 'CALL', 'PUT'], default='ALL',
+                        help='With --option-chain: CALL, PUT, or ALL (default: ALL)')
+    parser.add_argument('--batch-size', type=int, default=50,
+                        help='With --option-chain: contracts per SUBS/ADD batch (default: 50)')
+    parser.add_argument('--token', '-t', type=str, default=DEFAULT_ACCESS_TOKEN_FILE,
+                        help=f'Access token file, raw token on one line (default: {DEFAULT_ACCESS_TOKEN_FILE})')
+    parser.add_argument('--data-dir', '-d', type=str, default=DEFAULT_DATA_OUTPUT_DIR,
+                        help=f'Output directory for .parquet files (default: {DEFAULT_DATA_OUTPUT_DIR})')
+    parser.add_argument('--parquet-flush-rows', type=int, default=DEFAULT_PARQUET_FLUSH_ROWS,
+                        help=f'Rows buffered per symbol before Parquet flush '
+                             f'(default: {DEFAULT_PARQUET_FLUSH_ROWS})')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug mode')
 
     args = parser.parse_args()
 
-    # Create client with configurable parameters
-    client = SchwabWebSocketClient(
-        debug=args.debug,
-        symbols_filepath=args.symbols,
-        option_symbols_filepath=args.options,
-        access_token_filepath=args.token,
-        data_output_dir=args.data_dir
-    )
+    if args.min_dte < 0:
+        raise SystemExit('--min-dte must be >= 0')
+    if args.strike_range < 0:
+        raise SystemExit('--strike-range must be >= 0 (0 = entire chain)')
+    if args.batch_size < 1:
+        raise SystemExit('--batch-size must be >= 1')
+    if args.parquet_flush_rows < 1:
+        raise SystemExit('--parquet-flush-rows must be >= 1')
+
+    chain_mode = args.option_chain is not None
+    if chain_mode:
+        underlying = args.option_chain.upper().strip()
+        if not underlying:
+            raise SystemExit('--option-chain requires a ticker symbol (e.g. SPY)')
+        client = SchwabWebSocketClient(
+            debug=args.debug,
+            access_token_filepath=args.token,
+            data_output_dir=args.data_dir,
+            equity_symbols=[],
+            option_symbols=[],
+            auto_subscribe=False,
+            parquet_flush_rows=args.parquet_flush_rows,
+        )
+    else:
+        client = SchwabWebSocketClient(
+            debug=args.debug,
+            symbols_filepath=args.symbols,
+            option_symbols_filepath=args.options,
+            access_token_filepath=args.token,
+            data_output_dir=args.data_dir,
+            parquet_flush_rows=args.parquet_flush_rows,
+        )
 
     try:
-        # Check if it's before market hours and wait until 9:30 AM if needed
         if not client.wait_for_market_open():
             print("❌ Market is closed (weekend). Exiting...")
-            exit(0)
+            raise SystemExit(0)
 
-        # Connect to WebSocket
+        if chain_mode:
+            contracts, expiration_date, dte = client.load_option_chain(
+                underlying,
+                min_dte=args.min_dte,
+                contract_type=args.contract_type,
+                strike_range=args.strike_range if args.strike_range > 0 else None,
+            )
+            range_desc = (
+                f"ATM +/- {args.strike_range}"
+                if args.strike_range > 0
+                else "entire chain"
+            )
+            print(
+                f"📊 Option-chain mode: {underlying} {expiration_date} "
+                f"(DTE={dte}, {range_desc}) — {len(contracts)} contracts "
+                f"→ {args.data_dir}/options/*.parquet")
+
         print("🔌 Connecting to Schwab Streaming API...")
-        client.connect()
-
-        # Keep the script running until market close
-        while client.running and client.connected:
-            # Check if it's after market close (4:00:30 PM ET)
-            if client.is_after_market_close():
-                print("🕐 Market close time (4:00:30 PM ET) reached, disconnecting...")
-                client.disconnect()
-                break
-            time.sleep(1)
+        if chain_mode:
+            client.connect(run_until_close=False)
+            accepted = client.subscribe_option_chain(
+                contracts, batch_size=args.batch_size)
+            if accepted <= 0:
+                raise Exception("No option contracts were accepted for streaming")
+            print("📡 Streaming option chain until market close (Ctrl+C to stop)...")
+            while client.running and client.connected:
+                if client.is_after_market_close():
+                    print(
+                        "🕐 Market close time (4:00:30 PM ET) reached, disconnecting...")
+                    client.disconnect()
+                    break
+                client.flush_parquet()
+                time.sleep(1)
+        else:
+            client.connect()
+            while client.running and client.connected:
+                if client.is_after_market_close():
+                    print(
+                        "🕐 Market close time (4:00:30 PM ET) reached, disconnecting...")
+                    client.disconnect()
+                    break
+                client.flush_parquet()
+                time.sleep(1)
 
         print("✅ Streaming session completed")
 
@@ -978,3 +1512,4 @@ Examples:
     except Exception as e:
         print(f"❌ Error: {e}")
         client.disconnect()
+        raise SystemExit(1) from e

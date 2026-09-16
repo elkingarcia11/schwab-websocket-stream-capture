@@ -1,2 +1,50 @@
-.venv
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / credentials (never commit)
 schwab_access_token.txt
+schwab_access_token_*.txt
+schwab_refresh_token.txt
+schwab_tokens.json
+.env
+.env.*
+
+# Local symbol lists (commit only *.example templates)
+symbols.txt
+options_symbols.txt
+symbols_copy.txt
+options_symbols_copy.txt
+
+# Captured streaming output (Parquet)
+data/
+data_*/
+memory_samples/
+*_output/
+spy_0dte/
+spy_chain/
+*.parquet
+
+# Python bytecode / tooling caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

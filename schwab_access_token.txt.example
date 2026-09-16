@@ -1,0 +1,16 @@
+# Schwab access token for this WebSocket client
+#
+# REQUIRED API access (Trader API):
+#   - Accounts and Trading → Account Access
+#   - Accounts and Trading → User Preferences
+#
+# Needed so GET /trader/v1/userPreference succeeds and returns streamerInfo
+# (WebSocket URL + client IDs). Without that, streaming cannot start.
+#
+# DO NOT use a Market Data-only token (Trader API → Market Data).
+# Market Data tokens can call quotes/chains, but userPreference returns 401.
+#
+# Format: one line with the raw access token only (no "Bearer " prefix).
+# Lines starting with # are ignored.
+#
+YOUR_SCHWAB_TRADER_API_ACCESS_TOKEN_HERE
